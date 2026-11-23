@@ -1,5 +1,6 @@
 import os
 import gradio as gr
+torch.set_num_threads(1)
 import torch
 from models import Stage1Bigram, Stage2GPT, Stage3GPT, Stage3Config
 
@@ -66,7 +67,7 @@ def run_model(model, prompt, max_new_tokens, temperature, top_k):
         ids = ids[-100:]
         max_new_tokens = min(int(max_new_tokens), model.cfg.block_size - len(ids))
     idx = torch.tensor([ids], dtype=torch.long, device=device)
-    with torch.no_grad():
+    with torch.inference_mode():
         out = model.generate(
             idx,
             max_new_tokens=int(max_new_tokens),
@@ -145,7 +146,7 @@ with gr.Blocks(title="GPT From Scratch: 3-Stage Evolution") as demo:
             btn_cmp = gr.Button("Generate All 3", variant="primary", scale=1)
 
         with gr.Row():
-            tokens_cmp = gr.Slider(30, 200, value=140, step=10, label="Max New Characters")
+            tokens_cmp = gr.Slider(30, 160, value=80, step=10, label="Max New Characters")
             temp_cmp = gr.Slider(0.2, 1.5, value=0.8, step=0.1, label="Temperature")
             topk_cmp = gr.Slider(0, 65, value=40, step=5, label="Top-K (0 = off)")
 
