@@ -1,7 +1,7 @@
 import os
 import gradio as gr
-torch.set_num_threads(1)
 import torch
+torch.set_num_threads(1)
 from models import Stage1Bigram, Stage2GPT, Stage3GPT, Stage3Config
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
