@@ -169,7 +169,7 @@ with gr.Blocks(title="GPT From Scratch: 3-Stage Evolution") as demo:
             tokens_sgl = gr.Slider(30, 220, value=160, step=10, label="Max New Characters")
             temp_sgl = gr.Slider(0.2, 1.5, value=0.8, step=0.1, label="Temperature")
             topk_sgl = gr.Slider(0, 65, value=40, step=5, label="Top-K (0 = off)")
-        btn_sgl = gr.https://github.com/harshit1187/TinyGPT.gitButton("Generate", variant="primary")
+        btn_sgl = gr.Button("Generate", variant="primary")
         out_sgl = gr.Textbox(lines=12, label="Generated Output")
         btn_sgl.click(generate_single, [model_dd, prompt_sgl, tokens_sgl, temp_sgl, topk_sgl], out_sgl)
 
