@@ -1,4 +1,7 @@
+import html
 import os
+import re
+
 import gradio as gr
 import torch
 torch.set_num_threads(1)
@@ -19,7 +22,7 @@ def strip_compile_prefix(state_dict):
     return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
 
-# Load Stage 3 (Modern GPT)
+# Load the three models (any checkpoint that's missing is simply skipped)
 m3 = None
 if os.path.exists("gpt_stage3.pt"):
     ck = torch.load("gpt_stage3.pt", map_location=device, weights_only=False)
@@ -29,7 +32,6 @@ if os.path.exists("gpt_stage3.pt"):
     m3.eval()
     stoi = ck["stoi"]
 
-# Load Stage 2 (Vanilla GPT)
 m2 = None
 if os.path.exists("gpt_stage2.pt"):
     ck = torch.load("gpt_stage2.pt", map_location=device, weights_only=False)
@@ -39,7 +41,6 @@ if os.path.exists("gpt_stage2.pt"):
     m2.eval()
     stoi = stoi or s
 
-# Load Stage 1 (Bigram)
 m1 = None
 if os.path.exists("gpt_stage1.pt"):
     ck = torch.load("gpt_stage1.pt", map_location=device, weights_only=False)
@@ -49,19 +50,18 @@ if os.path.exists("gpt_stage1.pt"):
     m1.eval()
     stoi = stoi or s
 
+if stoi is None:
+    raise SystemExit("No checkpoints found (gpt_stage1.pt / gpt_stage2.pt / gpt_stage3.pt).")
+
 itos = {i: c for c, i in stoi.items()}
 
-ALL_MODELS = {
-    "Stage 3: Modern Llama-Style GPT (10.64M params)": m3,
-    "Stage 2: Vanilla Transformer GPT (10.79M params)": m2,
-    "Stage 1: Bigram Baseline (4,225 params)": m1,
-}
+ALL_MODELS = {"Modern GPT": m3, "Classic GPT": m2, "Bigram": m1}
 ACTIVE_MODELS = {k: v for k, v in ALL_MODELS.items() if v is not None}
+ALL_THREE = "All three"
+CHOICES = list(ACTIVE_MODELS) + ([ALL_THREE] if len(ACTIVE_MODELS) > 1 else [])
 
 
 def run_model(model, prompt, max_new_tokens, temperature, top_k):
-    if model is None:
-        return "Checkpoint not uploaded."
     ids = [stoi[c] for c in prompt if c in stoi] or [0]
     if isinstance(model, Stage3GPT):
         ids = ids[-100:]
@@ -77,108 +77,226 @@ def run_model(model, prompt, max_new_tokens, temperature, top_k):
     return "".join(itos[i] for i in out[0].tolist())
 
 
-def compare_all(prompt, max_new_tokens, temperature, top_k):
-    out1 = run_model(m1, prompt, max_new_tokens, temperature, top_k)
-    yield out1, "Generating...", "Generating..."
-    out3 = run_model(m3, prompt, max_new_tokens, temperature, top_k)
-    yield out1, "Generating (no KV cache)...", out3
-    out2 = run_model(m2, prompt, max_new_tokens, temperature, top_k)
-    yield out1, out2, out3
-
-
-def generate_single(model_name, prompt, max_new_tokens, temperature, top_k):
-    return run_model(ACTIVE_MODELS[model_name], prompt, max_new_tokens, temperature, top_k)
-
-dark_theme = gr.themes.Soft(
-    primary_hue="indigo",
-    secondary_hue="cyan",
-    neutral_hue="slate",
-).set(
-    body_background_fill="#090d16",
-    body_background_fill_dark="#090d16",
-    block_background_fill="#111827",
-    block_background_fill_dark="#111827",
-    block_border_color="#1f2937",
-    block_border_color_dark="#1f2937",
-    block_label_text_color="#94a3b8",
-    block_label_text_color_dark="#94a3b8",
-    body_text_color="#f8fafc",
-    body_text_color_dark="#f8fafc",
-    input_background_fill="#0b1120",
-    input_background_fill_dark="#0b1120",
-    input_border_color="#334155",
-    input_border_color_dark="#334155",
-    button_primary_background_fill="linear-gradient(90deg, #4f46e5, #06b6d4)",
-    button_primary_background_fill_hover="linear-gradient(90deg, #4338ca, #0891b2)",
-    button_primary_text_color="#ffffff",
+# ---------------------------------------------------------------------------
+# What appears in the middle of the page
+# ---------------------------------------------------------------------------
+EMPTY = (
+    '<div class="hint">Begin with a few words.'
+    "<span>Press enter. Model, length and temperature are under options.</span></div>"
 )
 
-custom_css = """
+
+def words(text, total=3.0):
+    """Wrap each word in a span that fades in just after the one before it.
+    The browser does the animating, so there's no flicker from re-sending text."""
+    parts = re.findall(r"\S+|\s+", text)
+    count = sum(1 for p in parts if not p.isspace())
+    step = min(0.06, total / max(count, 1))
+    out, i = [], 0
+    for p in parts:
+        if p.isspace():
+            out.append(html.escape(p))
+        else:
+            out.append(f'<span class="w" style="animation-delay:{i * step:.2f}s">{html.escape(p)}</span>')
+            i += 1
+    return "".join(out)
+
+
+def render(items):
+    """items = [(label, text), ...]. One item -> big centred text, several -> quiet columns."""
+    if len(items) == 1:
+        return f'<div class="one">{words(items[0][1])}</div>'
+    cells = "".join(
+        f'<div class="cell"><div class="tag">{html.escape(label)}</div>'
+        f'<div class="txt">{words(text)}</div></div>'
+        for label, text in items
+    )
+    return f'<div class="many">{cells}</div>'
+
+
+def write(choice, prompt, length, temperature, top_k):
+    prompt = (prompt or "").strip("\n")
+    if prompt.rstrip().endswith(":"):      # "ROMEO:" works much better as "ROMEO:\n"
+        prompt = prompt.rstrip() + "\n"
+
+    names = ["Bigram", "Classic GPT", "Modern GPT"] if choice == ALL_THREE else [choice]
+    names = [n for n in names if n in ACTIVE_MODELS]
+
+    yield gr.update(), "Thinking…"
+    results = [(n, run_model(ACTIVE_MODELS[n], prompt, length, temperature, top_k)) for n in names]
+
+    yield render(results), ""   # sent once; the words fade in on their own in the browser
+
+
+# ---------------------------------------------------------------------------
+# Look: black page, soft grey text, almost no chrome
+# ---------------------------------------------------------------------------
+theme = gr.themes.Base(primary_hue="slate", neutral_hue="neutral").set(
+    body_background_fill="#000000",
+    body_background_fill_dark="#000000",
+    block_background_fill="#000000",
+    block_background_fill_dark="#000000",
+    block_border_color="#141414",
+    block_border_color_dark="#141414",
+    block_label_text_color="#777777",
+    block_label_text_color_dark="#777777",
+    body_text_color="#e6e6e6",
+    body_text_color_dark="#e6e6e6",
+    input_background_fill="#0a0a0a",
+    input_background_fill_dark="#0a0a0a",
+    input_border_color="#222222",
+    input_border_color_dark="#222222",
+    button_secondary_background_fill="#161616",
+    button_secondary_background_fill_dark="#161616",
+    button_secondary_background_fill_hover="#222222",
+    button_secondary_background_fill_hover_dark="#222222",
+    button_secondary_text_color="#9a9a9a",
+    button_secondary_text_color_dark="#9a9a9a",
+    slider_color="#6b6b6b",
+    slider_color_dark="#6b6b6b",
+)
+
+css = """
+footer { display: none !important; }
+
 body, .gradio-container {
-    background-color: #090d16 !important;
-    color: #f8fafc !important;
+    background: #000 !important;
+    color: #e6e6e6 !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif !important;
 }
-h1 {
-    background: linear-gradient(90deg, #818cf8, #22d3ee);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight: 800 !important;
-    letter-spacing: -0.5px;
+.gradio-container {
+    max-width: 100% !important;
+    padding-bottom: 140px !important;
 }
-textarea {
-    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
-    font-size: 13.5px !important;
-    line-height: 1.55 !important;
-    color: #e2e8f0 !important;
+
+/* no boxes around things */
+.gradio-container .block, .gradio-container .form {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+
+/* "Thinking…" in the top corner */
+#status {
+    position: fixed; top: 14px; right: 24px; z-index: 30;
+    width: auto !important; min-height: 0 !important; padding: 0 !important;
+    color: #777 !important; font-size: 13px; letter-spacing: 0.05em;
+}
+#status * { color: #777 !important; }
+
+/* options, folded away */
+#options {
+    max-width: 520px; margin: 14px auto 0 !important;
+}
+#options > button, #options .label-wrap { color: #6f6f6f !important; font-size: 13px !important; }
+
+/* the middle of the page */
+#stage { min-height: 66vh; padding: 0 24px; }
+#stage .one, #stage .many, #stage .hint { margin-top: 18vh; }
+#stage .one {
+    max-width: 720px; margin-left: auto; margin-right: auto;
+    text-align: center; white-space: pre-wrap;
+    font-size: 22px; line-height: 1.75; color: #e8e8e8 !important;
+}
+#stage .hint {
+    text-align: center; font-size: 22px; color: #555 !important;
+}
+#stage .hint span {
+    display: block; margin-top: 14px; font-size: 14px; color: #3f3f3f !important;
+}
+#stage .many {
+    display: grid; gap: 44px; max-width: 1040px;
+    margin-left: auto; margin-right: auto;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+#stage .cell .tag {
+    text-align: center; margin-bottom: 14px;
+    font-size: 12px; letter-spacing: 0.08em; color: #6a6a6a !important;
+}
+#stage .cell .txt {
+    text-align: center; white-space: pre-wrap;
+    font-size: 17px; line-height: 1.75; color: #dcdcdc !important;
+}
+
+/* the bar along the bottom */
+#bar {
+    position: fixed !important; left: 0; right: 0; bottom: 0; z-index: 20;
+    background: #000 !important;
+    border-top: 1px solid #121212 !important;
+    padding: 18px 28px 22px !important;
+    gap: 16px !important; align-items: center !important; flex-wrap: nowrap !important;
+}
+#prompt input, #prompt textarea {
+    background: transparent !important;
+    border: none !important; border-bottom: 1px solid #222 !important;
+    border-radius: 0 !important; box-shadow: none !important;
+    color: #e8e8e8 !important; font-size: 16px !important; text-align: center;
+}
+#prompt input::placeholder, #prompt textarea::placeholder { color: #666 !important; }
+#send {
+    width: 44px !important; min-width: 44px !important; height: 44px !important;
+    border-radius: 50% !important; padding: 0 !important; font-size: 18px !important;
+    border: none !important;
+}
+
+/* ---- motion: slow, soft, never abrupt ---- */
+html { scroll-behavior: smooth; }
+
+@keyframes drift {
+    from { opacity: 0; transform: translateY(6px); filter: blur(3px); }
+    to   { opacity: 1; transform: none; filter: blur(0); }
+}
+@keyframes breathe { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.9; } }
+@keyframes settle  { from { opacity: 0; } to { opacity: 1; } }
+
+#stage .w {
+    display: inline-block;
+    opacity: 0;
+    animation: drift 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+#stage .hint { animation: settle 1.6s ease both; }
+#status * { animation: breathe 2.4s ease-in-out infinite; }
+
+#prompt input, #prompt textarea { transition: border-color 0.4s ease; }
+#prompt input:focus, #prompt textarea:focus {
+    border-bottom-color: #555 !important; outline: none !important; box-shadow: none !important;
+}
+#send { transition: background 0.3s ease, transform 0.25s ease; }
+#send:hover { transform: scale(1.06); }
+
+@media (prefers-reduced-motion: reduce) {
+    #stage .w, #stage .hint, #status * { animation: none !important; opacity: 1 !important; filter: none !important; }
 }
 """
 
-with gr.Blocks(title="GPT From Scratch: 3-Stage Evolution") as demo:
-    gr.Markdown(
-        "# Building a GPT From Scratch: 3-Stage Evolution\n"
-        "Compare three character-level language models trained on **Tiny Shakespeare**—"
-        "from a 4,225-parameter Bigram lookup table to a 10.64M-parameter Llama-style Transformer."
-    )
+with gr.Blocks(title="A Tiny GPT") as demo:
+    status = gr.HTML("", elem_id="status")
 
-    with gr.Tab("Side-by-Side Comparison"):
-        with gr.Row():
-            prompt_cmp = gr.Textbox(value="ROMEO:\n", lines=2, label="Prompt", scale=3)
-            btn_cmp = gr.Button("Generate All 3", variant="primary", scale=1)
+    with gr.Accordion("options", open=False, elem_id="options"):
+        choice = gr.Radio(CHOICES, value=CHOICES[0], label="Model")
+        length = gr.Slider(30, 220, value=120, step=10, label="Length (characters)")
+        temperature = gr.Slider(0.2, 1.5, value=0.8, step=0.1, label="Temperature")
+        top_k = gr.Slider(0, 65, value=40, step=5, label="Top-K (0 = off)")
 
-        with gr.Row():
-            tokens_cmp = gr.Slider(30, 160, value=80, step=10, label="Max New Characters")
-            temp_cmp = gr.Slider(0.2, 1.5, value=0.8, step=0.1, label="Temperature")
-            topk_cmp = gr.Slider(0, 65, value=40, step=5, label="Top-K (0 = off)")
+    stage = gr.HTML(EMPTY, elem_id="stage")
 
-        with gr.Row():
-            box1 = gr.Textbox(lines=11, label="Stage 1: Bigram (4,225 params | Loss ~2.45)")
-            box2 = gr.Textbox(lines=11, label="Stage 2: Vanilla GPT (10.79M params | Loss ~1.48)")
-            box3 = gr.Textbox(lines=11, label="Stage 3: Modern GPT (10.64M params | Loss ~1.47)")
-
-        gr.Examples(
-            examples=[["ROMEO:\n"], ["To be, or not "], ["KING HENRY:\nWhat news"]],
-            inputs=prompt_cmp,
+    with gr.Row(elem_id="bar"):
+        prompt = gr.Textbox(
+            placeholder="Start with a few words…", show_label=False, container=False,
+            lines=1, max_lines=1, elem_id="prompt", scale=12,
         )
-        btn_cmp.click(compare_all, [prompt_cmp, tokens_cmp, temp_cmp, topk_cmp], [box1, box2, box3])
+        send = gr.Button("→", elem_id="send", scale=0, min_width=44)
 
-    with gr.Tab("Single Model Playground"):
-        model_dd = gr.Dropdown(
-            list(ACTIVE_MODELS.keys()), value=list(ACTIVE_MODELS.keys())[0], label="Choose Model"
-        )
-        prompt_sgl = gr.Textbox(value="JULIET:\n", lines=2, label="Prompt")
-        with gr.Row():
-            tokens_sgl = gr.Slider(30, 220, value=160, step=10, label="Max New Characters")
-            temp_sgl = gr.Slider(0.2, 1.5, value=0.8, step=0.1, label="Temperature")
-            topk_sgl = gr.Slider(0, 65, value=40, step=5, label="Top-K (0 = off)")
-        btn_sgl = gr.Button("Generate", variant="primary")
-        out_sgl = gr.Textbox(lines=12, label="Generated Output")
-        btn_sgl.click(generate_single, [model_dd, prompt_sgl, tokens_sgl, temp_sgl, topk_sgl], out_sgl)
+    inputs = [choice, prompt, length, temperature, top_k]
+    # show_progress="hidden" turns off Gradio's own loading overlay; the status text does that job
+    prompt.submit(write, inputs, [stage, status], show_progress="hidden")
+    send.click(write, inputs, [stage, status], show_progress="hidden")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,
-        theme=dark_theme,
-        css=custom_css,
+        theme=theme,
+        css=css,
     )
